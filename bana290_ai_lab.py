@@ -129,3 +129,102 @@ df["LOG_REV"] = np.log1p(df["ANNUAL_REV"])
 df_clean = df.dropna(subset=["REV_GROWTH","AI_ADOPTED","ANNUAL_REV","TEAM_SIZE","DIGITAL_SALES","FIRM_AGE","RD_SPEND"]).copy()
 print(f"\nRows after cleaning: {len(df_clean)} (dropped {len(df)-len(df_clean)})")
 print(df_clean["AI_ADOPTED"].value_counts())
+
+# =============================================================================
+# STAGE 3 - ANALYZE
+# Prompt: "Run OLS baseline, estimate propensity scores, perform nearest-neighbor 
+# matching, compute SMD"
+# =============================================================================
+
+import statsmodels.api as sm
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import NearestNeighbors
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+# 3a. Baseline OLS
+X_ols = sm.add_constant(df_clean[["AI_ADOPTED"]])
+ols_model = sm.OLS(df_clean["REV_GROWTH"], X_ols).fit()
+print("\n" + "="*70)
+print("BASELINE OLS")
+print("="*70)
+print(ols_model.summary())
+print(f"Naive AI coefficient: {ols_model.params['AI_ADOPTED']:.4f}")
+
+# 3b. Propensity Score Estimation
+covariates = ["LOG_REV","TEAM_SIZE","FIRM_AGE","RD_SPEND","DIGITAL_SALES","COMPLIANCE_TIER_NUM","FRAUD_EXPOSURE_NUM"]
+psm_df = df_clean.dropna(subset=covariates).copy()
+X_ps = psm_df[covariates].values
+y_ps = psm_df["AI_ADOPTED"].values.astype(int)
+logit = LogisticRegression(max_iter=1000, random_state=42)
+logit.fit(X_ps, y_ps)
+psm_df["PSCORE"] = logit.predict_proba(X_ps)[:, 1]
+
+# Logit summary table
+X_logit_sm = sm.add_constant(psm_df[covariates])
+logit_sm = sm.Logit(psm_df["AI_ADOPTED"], X_logit_sm).fit(disp=0)
+print("\n" + "="*70)
+print("PROPENSITY SCORE MODEL")
+print("="*70)
+print(logit_sm.summary())
+
+# 3c. Common Support Plot
+treated = psm_df[psm_df["AI_ADOPTED"]==1]["PSCORE"]
+control = psm_df[psm_df["AI_ADOPTED"]==0]["PSCORE"]
+fig, ax = plt.subplots(figsize=(8,5))
+ax.hist(treated, bins=20, alpha=0.6, label="AI Adopted (Treated)", color="#2196F3", density=True)
+ax.hist(control, bins=20, alpha=0.6, label="No AI (Control)", color="#FF9800", density=True)
+ax.set_xlabel("Propensity Score"); ax.set_ylabel("Density")
+ax.set_title("Common Support: Propensity Score Distribution")
+ax.legend(); ax.grid(axis="y", alpha=0.3)
+plt.tight_layout(); plt.savefig("fig_common_support.png", dpi=200); plt.close()
+
+# 3d. Nearest-Neighbor Matching
+treated_idx = psm_df[psm_df["AI_ADOPTED"]==1].index
+control_idx = psm_df[psm_df["AI_ADOPTED"]==0].index
+nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
+nn.fit(psm_df.loc[control_idx, ["PSCORE"]].values)
+distances, indices = nn.kneighbors(psm_df.loc[treated_idx, ["PSCORE"]].values)
+matched_control_idx = control_idx[indices.flatten()]
+matched_df = pd.concat([psm_df.loc[treated_idx].copy(), psm_df.loc[matched_control_idx].copy()], ignore_index=True)
+print(f"\nMatched sample: {len(matched_df)} rows ({len(treated_idx)} treated + {len(treated_idx)} controls)")
+
+# 3e. SMD Before and After
+def calc_smd(df_t, df_c, col):
+    std_pool = np.sqrt((df_t[col].var() + df_c[col].var()) / 2)
+    return (df_t[col].mean() - df_c[col].mean()) / std_pool if std_pool != 0 else 0.0
+
+smd_results = []
+for cov in covariates:
+    smd_b = calc_smd(psm_df[psm_df["AI_ADOPTED"]==1], psm_df[psm_df["AI_ADOPTED"]==0], cov)
+    smd_a = calc_smd(matched_df[matched_df["AI_ADOPTED"]==1], matched_df[matched_df["AI_ADOPTED"]==0], cov)
+    smd_results.append({"Covariate": cov, "SMD_Before": round(smd_b,4), "SMD_After": round(smd_a,4)})
+smd_df = pd.DataFrame(smd_results)
+print("\n" + "="*70)
+print("SMD TABLE")
+print("="*70)
+print(smd_df.to_string(index=False))
+
+# 3f. Love Plot
+fig, ax = plt.subplots(figsize=(8,6))
+y_pos = range(len(smd_df))
+ax.scatter(smd_df["SMD_Before"].abs(), y_pos, marker="o", s=80, color="#FF5722", label="Before Matching", zorder=3)
+ax.scatter(smd_df["SMD_After"].abs(), y_pos, marker="D", s=80, color="#4CAF50", label="After Matching", zorder=3)
+ax.axvline(x=0.1, color="gray", linestyle="--", alpha=0.7, label="SMD = 0.1 threshold")
+ax.set_yticks(list(y_pos)); ax.set_yticklabels(smd_df["Covariate"])
+ax.set_xlabel("|Standardized Mean Difference|")
+ax.set_title("Love Plot: Covariate Balance Before & After Matching")
+ax.legend(); ax.grid(axis="x", alpha=0.3)
+plt.tight_layout(); plt.savefig("fig_love_plot.png", dpi=200); plt.close()
+
+# 3g. PSM-Adjusted OLS
+X_psm = sm.add_constant(matched_df[["AI_ADOPTED"]])
+psm_model = sm.OLS(matched_df["REV_GROWTH"], X_psm).fit()
+print("\n" + "="*70)
+print("PSM-ADJUSTED OLS")
+print("="*70)
+print(psm_model.summary())
+print(f"Naive coeff: {ols_model.params['AI_ADOPTED']:.4f} -> PSM coeff: {psm_model.params['AI_ADOPTED']:.4f}")
